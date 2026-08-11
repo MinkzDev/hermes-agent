@@ -47,6 +47,18 @@ _models_dev_retry_after: float = 0
 _models_dev_fetch_lock = threading.Lock()
 _models_dev_refresh_lock = threading.Lock()
 _models_dev_refresh_in_flight = False
+_models_dev_automatic_refresh_enabled = True
+
+
+def set_automatic_refresh_enabled(enabled: bool) -> None:
+    """Enable or disable models.dev network refreshes for this process.
+
+    Quiet interactive sessions disable refreshes before agent construction so
+    ordinary model metadata lookups may read an existing cache but can neither
+    contact models.dev nor rewrite the cache.
+    """
+    global _models_dev_automatic_refresh_enabled
+    _models_dev_automatic_refresh_enabled = bool(enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +399,10 @@ def fetch_models_dev(
     that must never wait on the network.
     """
     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+
+    if not _models_dev_automatic_refresh_enabled:
+        force_refresh = False
+        allow_network = False
 
     if not allow_network:
         if _models_dev_cache:

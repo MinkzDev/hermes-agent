@@ -1750,14 +1750,24 @@ class TestRetryAfterCap:
     Retry-After header up to a 600s ceiling (was 120s, which retried before
     Tier-1 reset windows of ~171s and re-tripped the limit)."""
 
-    def _drive_once(self, agent, retry_after_value):
+    def _drive_once(
+        self,
+        agent,
+        retry_after_value,
+        *,
+        adapter_retry_after=None,
+        include_header=True,
+    ):
         """Raise one 429 carrying ``Retry-After`` and capture the wait the loop
         chose. Interrupt during the backoff sleep so the test doesn't actually
         wait, and return the status string that reports the wait time."""
 
         class _RateLimitError(Exception):
             status_code = 429
-            response = SimpleNamespace(headers={"retry-after": str(retry_after_value)})
+            response = SimpleNamespace(
+                headers={"retry-after": str(retry_after_value)} if include_header else {}
+            )
+            retry_after = adapter_retry_after
 
             def __str__(self):
                 return "Error code: 429 - Rate limit exceeded."
@@ -1788,6 +1798,19 @@ class TestRetryAfterCap:
         # 300s > old 120s cap but < new 600s cap → used verbatim.
         status = self._drive_once(agent, 300)
         assert "Waiting 300.0s" in status
+
+    def test_native_adapter_retry_after_is_honored_without_header(self, agent):
+        status = self._drive_once(
+            agent,
+            0,
+            adapter_retry_after=25.836753683,
+            include_header=False,
+        )
+        assert "Waiting 25.8s" in status
+
+    def test_retry_after_header_precedes_native_adapter_delay(self, agent):
+        status = self._drive_once(agent, 40, adapter_retry_after=25)
+        assert "Waiting 40.0s" in status
 
 
 

@@ -4264,6 +4264,13 @@ class _VoiceInputMessage:
         return self.text
 
 
+def _configure_models_dev_automatic_refresh(*, quiet: bool) -> None:
+    """Keep interactive quiet sessions read-only with respect to models.dev."""
+    from agent.models_dev import set_automatic_refresh_enabled
+
+    set_automatic_refresh_enabled(not quiet)
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -4282,6 +4289,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         base_url: str = None,
         max_turns: int = None,
         verbose: Optional[bool] = None,
+        quiet: bool = False,
         compact: bool = False,
         resume: str = None,
         checkpoints: bool = False,
@@ -4300,6 +4308,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             base_url: API base URL (default: OpenRouter)
             max_turns: Maximum tool-calling iterations shared with subagents (default: 500)
             verbose: Enable verbose logging
+            quiet: Suppress interactive startup chrome and background prewarming
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
@@ -4307,11 +4316,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        self.quiet = bool(quiet)
+        _configure_models_dev_automatic_refresh(quiet=self.quiet)
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
         _raw_tp = CLI_CONFIG["display"].get("tool_progress", "all")
         self.tool_progress_mode = "off" if _raw_tp is False else str(_raw_tp)
+        if self.quiet:
+            self.tool_progress_mode = "off"
         # focus_view: display-only reduced-output mode (/focus). When on, the
         # tool-progress mode is snapped to "off" so the EXISTING suppression
         # path hides per-tool lines, and the pre-focus mode is stashed so
@@ -15284,17 +15297,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # responses, and prompt all appear pinned to the bottom — empty
         # space stays above, not below.  This prints enough blank lines to
         # scroll the cursor to the last row before any content is rendered.
-        try:
-            _term_lines = shutil.get_terminal_size().lines
-            if _term_lines > 2:
-                print("\n" * (_term_lines - 1), end="", flush=True)
-        except Exception:
-            pass
+        if not self.quiet:
+            try:
+                _term_lines = shutil.get_terminal_size().lines
+                if _term_lines > 2:
+                    print("\n" * (_term_lines - 1), end="", flush=True)
+            except Exception:
+                pass
 
-        self.show_banner()
-        # Surface any active supply-chain security advisories right after the
-        # welcome banner. Quiet/single-query paths call this themselves.
-        self._show_security_advisories()
+            self.show_banner()
+            # Surface active supply-chain advisories after the welcome banner.
+            # Interactive quiet mode suppresses all startup-only effects.
+            self._show_security_advisories()
 
         # First-run: a completely unconfigured install must route into
         # provider onboarding, not a chat that cannot work. Previously a
@@ -15302,7 +15316,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # with a provider-specific error the user never chose. Only fires
         # on a real TTY; quiet/single-query paths keep their own handling.
         try:
-            if sys.stdin.isatty() and not self._runtime_credentials_ready():
+            if (
+                not self.quiet
+                and sys.stdin.isatty()
+                and not self._runtime_credentials_ready()
+            ):
                 self._offer_first_run_setup()
         except Exception:
             logger.debug("first-run setup offer failed", exc_info=True)
@@ -15311,27 +15329,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # so the user has context before typing their first message.
         if self._resumed:
             if self._preload_resumed_session():
-                self._display_resumed_history()
+                if not self.quiet:
+                    self._display_resumed_history()
 
-        try:
-            from hermes_cli.skin_engine import get_active_skin
-            _welcome_skin = get_active_skin()
-            _welcome_text = _welcome_skin.get_branding("welcome", "Welcome to Hermes Agent! Type your message or /help for commands.")
-            _welcome_color = _welcome_skin.get_color("banner_text", "#FFF8DC")
-        except Exception:
-            _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
-            _welcome_color = "#FFF8DC"
-        self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
+        if not self.quiet:
+            try:
+                from hermes_cli.skin_engine import get_active_skin
+                _welcome_skin = get_active_skin()
+                _welcome_text = _welcome_skin.get_branding("welcome", "Welcome to Hermes Agent! Type your message or /help for commands.")
+                _welcome_color = _welcome_skin.get_color("banner_text", "#FFF8DC")
+            except Exception:
+                _welcome_skin = None
+                _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
+                _welcome_color = "#FFF8DC"
+            self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
 
         # Warm the /model picker's provider-models cache off-thread during this
         # idle window (banner shown, user about to type). The no-args picker
         # otherwise blocks ~1-2s on serial /v1/models fetches the first time
         # it's opened in a session. Fire-and-forget, guarded once-per-process.
-        try:
-            from hermes_cli.model_switch import prewarm_picker_cache_async
-            prewarm_picker_cache_async()
-        except Exception:
-            pass
+        if not self.quiet:
+            try:
+                from hermes_cli.model_switch import prewarm_picker_cache_async
+                prewarm_picker_cache_async()
+            except Exception:
+                pass
 
         # Pre-import the agent runtime off-thread during the same idle window.
         # The first turn otherwise pays ~1.5s of module imports on the
@@ -15342,7 +15364,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # main thread simply blocks on the remaining import work instead of
         # redoing it. Skipped when agent startup is explicitly deferred
         # (Termux) — that path defers heavy work on purpose.
-        if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
+        if (
+            not self.quiet
+            and os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1"
+        ):
             def _prewarm_agent_runtime() -> None:
                 try:
                     import run_agent  # noqa: F401  (imports model_tools + tool registry)
@@ -15362,7 +15387,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # see that they're running without the safety net.
         try:
             _redact_raw = os.getenv("HERMES_REDACT_SECRETS", "true")
-            if _redact_raw.lower() not in {"1", "true", "yes", "on"}:
+            if (
+                not self.quiet
+                and _redact_raw.lower() not in {"1", "true", "yes", "on"}
+            ):
                 self._console_print(
                     "[bold red]⚠  Secret redaction is DISABLED[/] "
                     f"(HERMES_REDACT_SECRETS={_redact_raw}). "
@@ -15384,7 +15412,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 mark_seen,
                 openclaw_residue_hint_cli,
             )
-            if not is_seen(self.config, OPENCLAW_RESIDUE_FLAG) and detect_openclaw_residue():
+            if (
+                not self.quiet
+                and not is_seen(self.config, OPENCLAW_RESIDUE_FLAG)
+                and detect_openclaw_residue()
+            ):
                 try:
                     _resid_color = _welcome_skin.get_color("banner_dim", "#B8860B")
                 except Exception:
@@ -15400,12 +15432,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Show a random tip to help users discover features
         try:
             from hermes_cli.tips import get_random_tip
-            _tip = get_random_tip()
-            try:
-                _tip_color = _welcome_skin.get_color("banner_dim", "#B8860B")
-            except Exception:
-                _tip_color = "#B8860B"
-            self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+            if not self.quiet:
+                _tip = get_random_tip()
+                try:
+                    _tip_color = _welcome_skin.get_color("banner_dim", "#B8860B")
+                except Exception:
+                    _tip_color = "#B8860B"
+                self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
         except Exception:
             pass  # Tips are non-critical — never break startup
 
@@ -15415,12 +15448,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # swallowed to avoid breaking session startup.
         try:
             from agent.curator import maybe_run_curator
-            maybe_run_curator(
-                idle_for_seconds=float("inf"),  # CLI startup = fully idle
-                on_summary=lambda msg: self._console_print(
-                    f"[dim #6b7684]💾 {msg}[/]"
-                ),
-            )
+            if not self.quiet:
+                maybe_run_curator(
+                    idle_for_seconds=float("inf"),  # CLI startup = fully idle
+                    on_summary=lambda msg: self._console_print(
+                        f"[dim #6b7684]💾 {msg}[/]"
+                    ),
+                )
         except Exception:
             pass
 
@@ -15429,7 +15463,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # URL is configured; swallows all errors so it never blocks startup.
         try:
             from tools.skills_sync_client import maybe_pull_skills
-            maybe_pull_skills()
+            if not self.quiet:
+                maybe_pull_skills()
         except Exception:
             pass
 
@@ -15440,13 +15475,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # network here. Fail-quiet, exactly like the personal pull above.
         try:
             from tools.skills_sync_client import maybe_pull_org_skills
-            maybe_pull_org_skills()
+            if not self.quiet:
+                maybe_pull_org_skills()
         except Exception:
             pass
         _skills_for_line = self.preloaded_skills or list(
             getattr(self, "_preload_skills_requested", []) or []
         )
-        if _skills_for_line and not self._startup_skills_line_shown:
+        if (
+            not self.quiet
+            and _skills_for_line
+            and not self._startup_skills_line_shown
+        ):
             # When the background --skills preload hasn't been folded in yet
             # (it joins at agent init), show the REQUESTED names — identical
             # to the loaded set except for typo'd names, which warn later.
@@ -15455,7 +15495,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 f"[bold {_accent_hex()}]Activated skills:[/] {skills_label}"
             )
             self._startup_skills_line_shown = True
-        self._console_print()
+        if not self.quiet:
+            self._console_print()
         
         # State for async operation
         self._agent_running = False
@@ -18535,6 +18576,7 @@ def main(
         base_url=base_url,
         max_turns=max_turns,
         verbose=verbose,
+        quiet=quiet,
         compact=compact,
         resume=resume,
         checkpoints=checkpoints,

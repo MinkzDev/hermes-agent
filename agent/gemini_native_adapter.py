@@ -20,6 +20,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import time
 import uuid
 from types import SimpleNamespace
@@ -839,6 +840,22 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
     return chunks
 
 
+def _parse_google_retry_delay(value: Any) -> Optional[float]:
+    """Parse a non-negative ``google.protobuf.Duration`` in seconds."""
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw.endswith("s"):
+        return None
+    try:
+        seconds = float(raw[:-1])
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0 or not math.isfinite(seconds):
+        return None
+    return seconds
+
+
 def gemini_http_error(
     response: httpx.Response, *, body_text: Optional[str] = None
 ) -> GeminiAPIError:
@@ -880,6 +897,8 @@ def gemini_http_error(
             md = detail.get("metadata")
             if isinstance(md, dict):
                 metadata = md
+        if retry_after is None and type_url.endswith("/google.rpc.RetryInfo"):
+            retry_after = _parse_google_retry_delay(detail.get("retryDelay"))
     header_retry = response.headers.get("Retry-After") or response.headers.get("retry-after")
     if header_retry:
         try:

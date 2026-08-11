@@ -74,9 +74,9 @@ class TestGeminiHttpErrorFreeTierGuidance:
     """gemini_http_error should append free-tier guidance for free-tier 429s."""
 
     class _FakeResp:
-        def __init__(self, status: int, text: str):
+        def __init__(self, status: int, text: str, headers: dict | None = None):
             self.status_code = status
-            self.headers: dict = {}
+            self.headers: dict = headers or {}
             self.text = text
 
     def test_free_tier_429_appends_guidance(self):
@@ -95,4 +95,25 @@ class TestGeminiHttpErrorFreeTierGuidance:
         err = gemini_http_error(self._FakeResp(429, body))
         assert "aistudio.google.com/apikey" not in str(err)
 
+    def test_retry_info_delay_is_exposed_for_outer_backoff(self):
+        body = (
+            '{"error":{"code":429,"message":"Rate limited",'
+            '"status":"RESOURCE_EXHAUSTED","details":[{'
+            '"@type":"type.googleapis.com/google.rpc.RetryInfo",'
+            '"retryDelay":"25.836753683s"}]}}'
+        )
+        err = gemini_http_error(self._FakeResp(429, body))
+        assert err.retry_after == 25.836753683
+
+    def test_retry_after_header_overrides_retry_info_delay(self):
+        body = (
+            '{"error":{"code":429,"message":"Rate limited",'
+            '"status":"RESOURCE_EXHAUSTED","details":[{'
+            '"@type":"type.googleapis.com/google.rpc.RetryInfo",'
+            '"retryDelay":"25s"}]}}'
+        )
+        err = gemini_http_error(
+            self._FakeResp(429, body, headers={"Retry-After": "40"})
+        )
+        assert err.retry_after == 40
 

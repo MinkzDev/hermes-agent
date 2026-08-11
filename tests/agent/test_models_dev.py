@@ -150,11 +150,13 @@ class TestFetchModelsDev:
         md._models_dev_cache_time = 0
         md._models_dev_retry_after = 0
         md._models_dev_refresh_in_flight = False
+        md.set_automatic_refresh_enabled(True)
         yield
         md._models_dev_cache = {}
         md._models_dev_cache_time = 0
         md._models_dev_retry_after = 0
         md._models_dev_refresh_in_flight = False
+        md.set_automatic_refresh_enabled(True)
 
 
 
@@ -310,6 +312,46 @@ class TestFetchModelsDev:
 
         assert result == expected
         mock_get.assert_not_called()
+
+    def test_automatic_refresh_disabled_uses_stale_disk_without_effects(self):
+        import agent.models_dev as md
+
+        md.set_automatic_refresh_enabled(False)
+        with patch.object(
+            md, "_load_disk_cache", return_value=SAMPLE_REGISTRY
+        ), patch.object(
+            md, "_disk_cache_age_seconds", return_value=md._MODELS_DEV_CACHE_TTL + 60
+        ), patch.object(
+            md, "_fetch_models_dev_from_network"
+        ) as mock_network, patch.object(
+            md, "_start_background_refresh_models_dev"
+        ) as mock_background, patch.object(
+            md, "_save_disk_cache"
+        ) as mock_save:
+            result = fetch_models_dev(force_refresh=True)
+
+        assert result == SAMPLE_REGISTRY
+        mock_network.assert_not_called()
+        mock_background.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_automatic_refresh_disabled_with_no_cache_has_no_effects(self):
+        import agent.models_dev as md
+
+        md.set_automatic_refresh_enabled(False)
+        with patch.object(md, "_load_disk_cache", return_value={}), patch.object(
+            md, "_fetch_models_dev_from_network"
+        ) as mock_network, patch.object(
+            md, "_start_background_refresh_models_dev"
+        ) as mock_background, patch.object(
+            md, "_save_disk_cache"
+        ) as mock_save:
+            result = fetch_models_dev()
+
+        assert result == {}
+        mock_network.assert_not_called()
+        mock_background.assert_not_called()
+        mock_save.assert_not_called()
 
 
 

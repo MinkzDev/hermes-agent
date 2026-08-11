@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import io
 
+import agent.models_dev as models_dev
+import cli as classic_cli
 import hermes_cli.model_switch as ms
 from tui_gateway import entry
 
@@ -99,3 +101,91 @@ def test_main_survives_prewarm_failure(monkeypatch):
 
     assert ("prewarm",) in events
     assert ("write", "gateway.ready") in events
+
+
+def test_classic_main_propagates_quiet_to_interactive_cli(monkeypatch):
+    """Interactive ``--quiet`` must reach HermesCLI instead of being dropped."""
+    captured: dict[str, object] = {}
+
+    class _StubCLI:
+        session_id = "quiet-interactive-test"
+        system_prompt = ""
+
+        def run(self):
+            captured["ran"] = True
+
+    def _build_cli(**kwargs):
+        captured.update(kwargs)
+        return _StubCLI()
+
+    monkeypatch.setattr(classic_cli, "HermesCLI", _build_cli)
+    monkeypatch.setattr(classic_cli.atexit, "register", lambda *_a, **_kw: None)
+
+    classic_cli.main(toolsets="clarify", quiet=True)
+
+    assert captured["quiet"] is True
+    assert captured["ran"] is True
+
+
+def test_classic_quiet_configures_models_dev_cache_read_only(monkeypatch):
+    """Quiet mode disables models.dev refresh; normal mode restores it."""
+    enabled_states: list[bool] = []
+    monkeypatch.setattr(
+        models_dev,
+        "set_automatic_refresh_enabled",
+        lambda enabled: enabled_states.append(enabled),
+    )
+
+    classic_cli._configure_models_dev_automatic_refresh(quiet=True)
+    classic_cli._configure_models_dev_automatic_refresh(quiet=False)
+
+    assert enabled_states == [False, True]
+
+
+def test_classic_interactive_quiet_disables_startup_effects(monkeypatch):
+    """Quiet startup must not inventory tools or prewarm provider caches."""
+    cli = object.__new__(classic_cli.HermesCLI)
+    cli.quiet = True
+    cli._resumed = False
+    cli.preloaded_skills = []
+    cli._startup_skills_line_shown = False
+
+    events: list[str] = []
+    monkeypatch.setattr(cli, "_claim_active_session", lambda *_a, **_kw: True)
+    monkeypatch.setattr(cli, "show_banner", lambda: events.append("banner"))
+    monkeypatch.setattr(
+        cli,
+        "_show_security_advisories",
+        lambda: events.append("security_advisories"),
+    )
+    monkeypatch.setattr(
+        ms,
+        "prewarm_picker_cache_async",
+        lambda: events.append("provider_prewarm"),
+    )
+
+    class _UnexpectedThread:
+        def __init__(self, *_args, **_kwargs):
+            events.append("agent_runtime_prewarm")
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(classic_cli.threading, "Thread", _UnexpectedThread)
+
+    class _StopAfterStartup(Exception):
+        pass
+
+    def _stop_before_plugins():
+        raise _StopAfterStartup
+
+    import hermes_cli.plugins as plugins
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", _stop_before_plugins)
+
+    try:
+        cli.run()
+    except _StopAfterStartup:
+        pass
+
+    assert events == []
