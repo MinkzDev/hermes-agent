@@ -157,6 +157,15 @@ _BXR_OPERATOR_DISCORD_TOOLS = frozenset({
     "mcp__bxr_operator__bxr_route",
     "mcp__bxr_operator__bxr_continue_plan",
 })
+_BXR_OPERATOR_DISCORD_TOOLSETS = ["bxr_operator"]
+
+
+def _require_bxr_operator_discord_toolsets(
+    resolved_toolsets: list[str],
+) -> list[str]:
+    if resolved_toolsets != _BXR_OPERATOR_DISCORD_TOOLSETS:
+        raise RuntimeError("Closed BXR Discord toolset mismatch")
+    return resolved_toolsets
 
 
 def _is_bxr_operator_discord_source(source: Any) -> bool:
@@ -25539,7 +25548,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
         if _bxr_closed_lane:
-            enabled_toolsets = []
+            enabled_toolsets = _require_bxr_operator_discord_toolsets(
+                enabled_toolsets
+            )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):

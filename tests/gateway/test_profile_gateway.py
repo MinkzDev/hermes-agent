@@ -11,11 +11,13 @@ import pytest
 from gateway.run import (
     TurnRunner,
     _BXR_OPERATOR_DISCORD_TOOLS,
+    _BXR_OPERATOR_DISCORD_TOOLSETS,
     _bxr_invoked_tool_names,
     _bxr_operator_session_metadata,
     _bxr_operator_tool_surface_is_exact,
     _gateway_tool_definition_names,
     _is_bxr_operator_discord_source,
+    _require_bxr_operator_discord_toolsets,
 )
 from gateway.config import Platform
 from gateway.turn_context import TurnContext
@@ -101,6 +103,26 @@ def test_closed_tool_schema_extraction_accepts_only_three_existing_bxr_tools():
     ) is False
     assert "terminal" not in names
     assert "send_message" not in names
+
+
+def test_closed_lane_preserves_only_the_exact_bxr_operator_toolset():
+    resolved = ["bxr_operator"]
+
+    assert _require_bxr_operator_discord_toolsets(resolved) is resolved
+    assert resolved == _BXR_OPERATOR_DISCORD_TOOLSETS
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        [],
+        ["clarify"],
+        ["bxr_operator", "clarify"],
+    ],
+)
+def test_closed_lane_rejects_missing_or_extra_toolsets(resolved):
+    with pytest.raises(RuntimeError, match="Closed BXR Discord toolset mismatch"):
+        _require_bxr_operator_discord_toolsets(resolved)
 
 
 def test_invoked_tool_projection_keeps_names_without_arguments_or_content():
@@ -267,7 +289,7 @@ def _exercise_turn_runner_until_conversation(
             },
             "display": {},
         },
-        enabled_toolsets=list(sorted(_BXR_OPERATOR_DISCORD_TOOLS)),
+        enabled_toolsets=list(_BXR_OPERATOR_DISCORD_TOOLSETS),
         disabled_toolsets=[],
         AIAgent=FixtureAgent,
         resolve_display_setting=lambda *_args, **_kwargs: None,
