@@ -41,7 +41,7 @@ import signal
 import threading
 import time
 from collections import OrderedDict
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
@@ -158,6 +158,36 @@ _BXR_OPERATOR_DISCORD_TOOLS = frozenset({
     "mcp__bxr_operator__bxr_continue_plan",
 })
 _BXR_OPERATOR_DISCORD_TOOLSETS = ["bxr_operator"]
+_BXR_OPERATOR_STATUS_TOOL = "mcp__bxr_operator__bxr_status"
+_BXR_OPERATOR_CONTINUE_TOOL = "mcp__bxr_operator__bxr_continue_plan"
+_BXR_METADATA_ONLY_LOG_MARKER = "<metadata-only>"
+_BXR_CLOSED_LANE_LOG_REDACTION = ContextVar(
+    "bxr_closed_lane_log_redaction",
+    default=False,
+)
+
+
+class _BxrClosedLaneTurnLogFilter(logging.Filter):
+    """Replace only the agent turn preview while the closed lane is active."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            _BXR_CLOSED_LANE_LOG_REDACTION.get()
+            and record.name == "agent.turn_context"
+            and str(record.msg).startswith("conversation turn:")
+            and isinstance(record.args, tuple)
+            and record.args
+        ):
+            args = list(record.args)
+            args[-1] = _BXR_METADATA_ONLY_LOG_MARKER
+            record.args = tuple(args)
+        return True
+
+
+_BXR_CLOSED_LANE_TURN_LOG_FILTER = _BxrClosedLaneTurnLogFilter()
+logging.getLogger("agent.turn_context").addFilter(
+    _BXR_CLOSED_LANE_TURN_LOG_FILTER
+)
 
 
 def _require_bxr_operator_discord_toolsets(
@@ -197,6 +227,35 @@ def _bxr_operator_tool_surface_is_exact(definitions: Any) -> bool:
     return _gateway_tool_definition_names(definitions) == _BXR_OPERATOR_DISCORD_TOOLS
 
 
+def _bxr_expected_tool_for_message(message: Any) -> Optional[str]:
+    """Map only the three finite live-acceptance request classes."""
+    if not isinstance(message, str):
+        return None
+    normalized = " ".join(message.split()).casefold().rstrip(" .!?")
+    return {
+        "bxr status": _BXR_OPERATOR_STATUS_TOOL,
+        "what needs my attention": _BXR_OPERATOR_STATUS_TOOL,
+        "continue bxr": _BXR_OPERATOR_CONTINUE_TOOL,
+    }.get(normalized)
+
+
+def _bxr_projected_tool_definitions(
+    definitions: Any,
+    expected_tool: str,
+) -> list[dict]:
+    """Project an exact accepted three-tool surface to one expected tool."""
+    if not _bxr_operator_tool_surface_is_exact(definitions):
+        raise RuntimeError("Closed BXR Discord tool surface mismatch")
+    projected = [
+        definition
+        for definition in definitions
+        if _gateway_tool_definition_names([definition]) == {expected_tool}
+    ]
+    if len(projected) != 1:
+        raise RuntimeError("Closed BXR Discord per-turn tool projection mismatch")
+    return projected
+
+
 def _bxr_invoked_tool_names(messages: Any) -> list[str]:
     names: set[str] = set()
     for message in messages or []:
@@ -210,6 +269,37 @@ def _bxr_invoked_tool_names(messages: Any) -> list[str]:
             if name in _BXR_OPERATOR_DISCORD_TOOLS:
                 names.add(str(name))
     return sorted(names)
+
+
+def _run_bxr_operator_projected_conversation(
+    agent: Any,
+    expected_tool: Optional[str],
+    conversation_call: Callable[[], dict],
+) -> dict:
+    """Run one closed turn with context-local logging and least privilege."""
+    original_tools = agent.tools
+    if not _bxr_operator_tool_surface_is_exact(original_tools):
+        raise RuntimeError("Closed BXR Discord tool surface mismatch")
+    if expected_tool is not None:
+        agent.tools = _bxr_projected_tool_definitions(
+            original_tools,
+            expected_tool,
+        )
+
+    log_token = _BXR_CLOSED_LANE_LOG_REDACTION.set(True)
+    try:
+        result = conversation_call()
+    finally:
+        _BXR_CLOSED_LANE_LOG_REDACTION.reset(log_token)
+        agent.tools = original_tools
+        if not _bxr_operator_tool_surface_is_exact(agent.tools):
+            raise RuntimeError("Closed BXR Discord tool surface restoration mismatch")
+
+    if expected_tool is not None:
+        invoked_tools = _bxr_invoked_tool_names(result.get("messages", []))
+        if invoked_tools != [expected_tool]:
+            raise RuntimeError("Closed BXR Discord invoked tool mismatch")
+    return result
 
 
 def _bxr_operator_session_metadata(source: Any, event: Any, invoked_tools: Any) -> dict:
@@ -4691,6 +4781,11 @@ class TurnRunner:
     def run_sync(self):
         ctx = self._ctx
         _bxr_closed_lane = _is_bxr_operator_discord_source(ctx.source)
+        _bxr_expected_tool = (
+            _bxr_expected_tool_for_message(ctx.message)
+            if _bxr_closed_lane
+            else None
+        )
         if _bxr_closed_lane:
             from agent.models_dev import set_automatic_refresh_enabled
 
@@ -5758,7 +5853,20 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            if _bxr_closed_lane:
+                result = _run_bxr_operator_projected_conversation(
+                    agent,
+                    _bxr_expected_tool,
+                    lambda: agent.run_conversation(
+                        _api_run_message,
+                        **_conversation_kwargs,
+                    ),
+                )
+            else:
+                result = agent.run_conversation(
+                    _api_run_message,
+                    **_conversation_kwargs,
+                )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -26774,7 +26882,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         pending = _pending_text or _build_media_placeholder(pending_event)
                     if pending:
-                        logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+                        _pending_preview = (
+                            _BXR_METADATA_ONLY_LOG_MARKER
+                            if _is_bxr_operator_discord_source(source)
+                            else pending[:40]
+                        )
+                        logger.debug(
+                            "Processing queued message after agent completion: '%s...'",
+                            _pending_preview,
+                        )
 
             # Leftover /steer: if a steer arrived after the last tool batch
             # (e.g. during the final API call), the agent couldn't inject it
@@ -26818,7 +26934,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending = None
 
             if pending_event or pending:
-                logger.debug("Processing pending message: '%s...'", pending[:40])
+                _pending_preview = (
+                    _BXR_METADATA_ONLY_LOG_MARKER
+                    if _is_bxr_operator_discord_source(source)
+                    else pending[:40]
+                )
+                logger.debug(
+                    "Processing pending message: '%s...'",
+                    _pending_preview,
+                )
 
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent

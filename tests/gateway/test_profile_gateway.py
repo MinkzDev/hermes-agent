@@ -2,6 +2,7 @@
 
 import datetime as dt
 import json
+import logging
 import socket
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -12,11 +13,15 @@ from gateway.run import (
     TurnRunner,
     _BXR_OPERATOR_DISCORD_TOOLS,
     _BXR_OPERATOR_DISCORD_TOOLSETS,
+    _BXR_METADATA_ONLY_LOG_MARKER,
+    _bxr_expected_tool_for_message,
     _build_gateway_agent_history,
     _bxr_invoked_tool_names,
     _bxr_operator_session_metadata,
     _bxr_operator_session_transcript_row,
     _bxr_operator_tool_surface_is_exact,
+    _bxr_projected_tool_definitions,
+    _run_bxr_operator_projected_conversation,
     _gateway_tool_definition_names,
     _is_bxr_operator_discord_source,
     _require_bxr_operator_discord_toolsets,
@@ -125,6 +130,166 @@ def test_closed_lane_preserves_only_the_exact_bxr_operator_toolset():
 def test_closed_lane_rejects_missing_or_extra_toolsets(resolved):
     with pytest.raises(RuntimeError, match="Closed BXR Discord toolset mismatch"):
         _require_bxr_operator_discord_toolsets(resolved)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("BXR status", "mcp__bxr_operator__bxr_status"),
+        ("  bxr   STATUS?!  ", "mcp__bxr_operator__bxr_status"),
+        ("What needs my attention?", "mcp__bxr_operator__bxr_status"),
+        ("Continue BXR", "mcp__bxr_operator__bxr_continue_plan"),
+        ("summarize this repository", None),
+    ],
+)
+def test_closed_lane_maps_only_finite_acceptance_requests(message, expected):
+    assert _bxr_expected_tool_for_message(message) == expected
+
+
+def _bxr_tool_definitions():
+    return [
+        {"name": "mcp__bxr_operator__bxr_status"},
+        {"function": {"name": "mcp__bxr_operator__bxr_route"}},
+        {"name": "mcp__bxr_operator__bxr_continue_plan"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("BXR status", "mcp__bxr_operator__bxr_status"),
+        ("What needs my attention?", "mcp__bxr_operator__bxr_status"),
+        ("Continue BXR", "mcp__bxr_operator__bxr_continue_plan"),
+    ],
+)
+def test_closed_lane_projects_one_tool_and_restores_full_surface(message, expected):
+    original = _bxr_tool_definitions()
+    agent = SimpleNamespace(tools=original)
+    observed = {}
+
+    def conversation_call():
+        observed["tools"] = list(agent.tools)
+        return {
+            "messages": [
+                {"role": "assistant", "tool_calls": [{"function": {"name": expected}}]}
+            ]
+        }
+
+    result = _run_bxr_operator_projected_conversation(
+        agent,
+        _bxr_expected_tool_for_message(message),
+        conversation_call,
+    )
+
+    assert result["messages"]
+    assert _gateway_tool_definition_names(observed["tools"]) == {expected}
+    assert agent.tools is original
+    assert _gateway_tool_definition_names(agent.tools) == _BXR_OPERATOR_DISCORD_TOOLS
+
+
+def test_closed_lane_restores_full_surface_after_exception():
+    original = _bxr_tool_definitions()
+    agent = SimpleNamespace(tools=original)
+
+    def conversation_call():
+        assert _gateway_tool_definition_names(agent.tools) == {
+            "mcp__bxr_operator__bxr_status"
+        }
+        raise RuntimeError("synthetic provider failure")
+
+    with pytest.raises(RuntimeError, match="synthetic provider failure"):
+        _run_bxr_operator_projected_conversation(
+            agent,
+            "mcp__bxr_operator__bxr_status",
+            conversation_call,
+        )
+    assert agent.tools is original
+    assert _gateway_tool_definition_names(agent.tools) == _BXR_OPERATOR_DISCORD_TOOLS
+
+
+@pytest.mark.parametrize(
+    "invoked",
+    [
+        [],
+        ["mcp__bxr_operator__bxr_route"],
+        [
+            "mcp__bxr_operator__bxr_route",
+            "mcp__bxr_operator__bxr_status",
+        ],
+    ],
+)
+def test_closed_status_lane_fails_before_return_on_wrong_tool_set(invoked):
+    agent = SimpleNamespace(tools=_bxr_tool_definitions())
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": name}} for name in invoked],
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="invoked tool mismatch"):
+        _run_bxr_operator_projected_conversation(
+            agent,
+            "mcp__bxr_operator__bxr_status",
+            lambda: {"messages": messages},
+        )
+
+
+def test_closed_lane_redacts_turn_log_without_changing_provider_input(caplog):
+    sentinel = "raw-content-sentinel-must-not-persist"
+    original = _bxr_tool_definitions()
+    agent = SimpleNamespace(tools=original)
+    logger = logging.getLogger("agent.turn_context")
+    observed = {}
+
+    def conversation_call():
+        observed["provider_input"] = sentinel
+        logger.info(
+            "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+            "session",
+            "model",
+            "provider",
+            "discord",
+            0,
+            sentinel,
+        )
+        return {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"function": {"name": "mcp__bxr_operator__bxr_status"}}
+                    ],
+                }
+            ]
+        }
+
+    with caplog.at_level(logging.INFO, logger="agent.turn_context"):
+        _run_bxr_operator_projected_conversation(
+            agent,
+            "mcp__bxr_operator__bxr_status",
+            conversation_call,
+        )
+
+    assert observed["provider_input"] == sentinel
+    assert sentinel not in caplog.text
+    assert _BXR_METADATA_ONLY_LOG_MARKER in caplog.text
+
+
+def test_non_bxr_turn_log_is_unchanged(caplog):
+    sentinel = "non-bxr-log-sentinel"
+    logger = logging.getLogger("agent.turn_context")
+    with caplog.at_level(logging.INFO, logger="agent.turn_context"):
+        logger.info(
+            "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+            "session",
+            "model",
+            "provider",
+            "cli",
+            0,
+            sentinel,
+        )
+    assert sentinel in caplog.text
 
 
 def test_invoked_tool_projection_keeps_names_without_arguments_or_content():
