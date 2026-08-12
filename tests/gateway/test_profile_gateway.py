@@ -17,6 +17,8 @@ from gateway.run import (
     _gateway_tool_definition_names,
     _is_bxr_operator_discord_source,
 )
+from gateway.config import Platform
+from gateway.turn_context import TurnContext
 
 
 @pytest.fixture(autouse=True)
@@ -178,3 +180,144 @@ def test_bxr_session_metadata_is_closed_content_free_and_authority_negative():
     assert "raw request must not persist" not in encoded
     assert "raw response must not persist" not in encoded
     assert "terminal" not in encoded
+
+
+class _StopClosedLaneRun(RuntimeError):
+    pass
+
+
+def _exercise_turn_runner_until_conversation(*, bxr_closed_lane):
+    session_db = SimpleNamespace(marker="session-db")
+    runner = MagicMock()
+    runner._get_system_prompt_for_channel.return_value = None
+    runner._resolve_session_agent_runtime.return_value = (
+        "fixture-model",
+        {"provider": "fixture-provider"},
+    )
+    runner._provider_routing = {}
+    runner._resolve_session_reasoning_config.return_value = None
+    runner._resolve_session_service_tier.return_value = None
+    runner._service_tier = None
+    runner.config = SimpleNamespace(
+        streaming=SimpleNamespace(enabled=False, transport="off")
+    )
+    runner._resolve_turn_agent_config.return_value = {
+        "model": "fixture-model",
+        "runtime": {"provider": "fixture-provider"},
+        "request_overrides": {},
+    }
+    runner._agent_config_signature.return_value = ("fixture-signature",)
+    runner._extract_cache_busting_config.return_value = {}
+    runner._agent_cache_lock = None
+    runner._agent_cache = None
+    runner._session_db = session_db
+    runner._prefill_messages = None
+    runner._refresh_fallback_model.return_value = None
+    runner._consume_pending_turn_sidecar_notes.return_value = []
+    runner._adapter_for_source.return_value = None
+    runner._pending_model_notes = {}
+    runner._consume_pending_native_image_paths.return_value = []
+    runner._attach_session_title_callback.return_value = None
+    runner.session_store = SimpleNamespace(_entries={})
+
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        profile="bxr-operator" if bxr_closed_lane else "default",
+        _bxr_operator_ingress=bxr_closed_lane,
+        user_id="fixture-user",
+        user_id_alt=None,
+        user_name="fixture-operator",
+        chat_id="fixture-channel",
+        chat_name="fixture-chat",
+        chat_type="channel",
+        thread_id=None,
+        parent_chat_id=None,
+    )
+    observed = {}
+
+    class FixtureAgent:
+        def __init__(self, **kwargs):
+            observed["constructor"] = kwargs
+            self.tools = [
+                {"name": name}
+                for name in sorted(_BXR_OPERATOR_DISCORD_TOOLS)
+            ] if bxr_closed_lane else []
+            self.session_id = None
+
+        def run_conversation(self, message, **kwargs):
+            observed["message"] = message
+            observed["conversation"] = kwargs
+            observed["agent"] = self
+            raise _StopClosedLaneRun
+
+    context = TurnContext(
+        source=source,
+        _run_still_current=lambda: True,
+        message="fixture request",
+        history=[],
+        session_id=None,
+        session_key="fixture-session",
+        user_config={
+            "gateway": {
+                "platforms": {"discord": {"skip_context_files": False}}
+            },
+            "display": {},
+        },
+        enabled_toolsets=list(sorted(_BXR_OPERATOR_DISCORD_TOOLS)),
+        disabled_toolsets=[],
+        AIAgent=FixtureAgent,
+        resolve_display_setting=lambda *_args, **_kwargs: None,
+        _hooks_ref=SimpleNamespace(loaded_hooks=False),
+    )
+
+    with pytest.raises(_StopClosedLaneRun):
+        TurnRunner(runner, context).run_sync()
+    return observed, session_db
+
+
+def test_turn_runner_closed_lane_applies_all_non_persistence_guards():
+    observed, _session_db = _exercise_turn_runner_until_conversation(
+        bxr_closed_lane=True
+    )
+    constructor = observed["constructor"]
+    agent = observed["agent"]
+
+    assert constructor["session_db"] is None
+    assert constructor["skip_context_files"] is True
+    assert constructor["skip_memory"] is True
+    assert constructor["skip_background_review"] is True
+    assert _bxr_operator_tool_surface_is_exact(agent.tools) is True
+    assert agent.tool_progress_callback is None
+    assert agent.tool_start_callback is None
+    assert agent.step_callback is None
+    assert agent.stream_delta_callback is None
+    assert agent.interim_assistant_callback is None
+    assert agent.status_callback is None
+    assert agent.event_callback is None
+    assert agent.background_review_callback is None
+    assert agent.clarify_callback is None
+    assert agent.memory_notifications == "off"
+    assert agent.thinking_progress is False
+    assert _bxr_operator_session_metadata(
+        SimpleNamespace(
+            profile="bxr-operator",
+            user_id="fixture-user",
+            guild_id="fixture-guild",
+            chat_id="fixture-channel",
+            parent_chat_id="",
+        ),
+        SimpleNamespace(message_id="fixture-message", timestamp=None),
+        [],
+    )["authority_granted"] is False
+
+
+def test_turn_runner_non_bxr_lane_keeps_normal_persistence_configuration():
+    observed, session_db = _exercise_turn_runner_until_conversation(
+        bxr_closed_lane=False
+    )
+    constructor = observed["constructor"]
+
+    assert constructor["session_db"] is session_db
+    assert constructor["skip_context_files"] is False
+    assert constructor["skip_memory"] is False
+    assert constructor["skip_background_review"] is False

@@ -4669,6 +4669,7 @@ class TurnRunner:
 
     def run_sync(self):
         ctx = self._ctx
+        _bxr_closed_lane = _is_bxr_operator_discord_source(ctx.source)
         # Historical note: as a nested closure this body declared
         # `nonlocal message` because the conditional re-assignments below
         # (prepending model-switch / resume-recovery notes) would otherwise
