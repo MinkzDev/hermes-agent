@@ -75,6 +75,22 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
 
+# BXR's Discord front door is deliberately a closed profile-only mode rather
+# than another permissive combination of the generic Discord switches.  The
+# constants are fixed by the BXR-HOE-DISCORD-001 contract and are not tunable
+# runtime knobs.
+_BXR_DISCORD_PROFILE_ID = "bxr-operator"
+_BXR_DISCORD_INPUT_LIMIT = 1000
+_BXR_DISCORD_OUTPUT_LIMIT = 8000
+_BXR_DISCORD_OUTPUT_MESSAGES = 4
+_BXR_DISCORD_EVENT_LIMIT = 4096
+_BXR_DISCORD_TOOL_NAMES = frozenset({
+    "mcp__bxr_operator__bxr_status",
+    "mcp__bxr_operator__bxr_route",
+    "mcp__bxr_operator__bxr_continue_plan",
+})
+_BXR_DISCORD_EVENT_WRITE_LOCK = threading.Lock()
+
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 # Discord enforces a hard cap of 100 global application (slash) commands per
@@ -1126,6 +1142,208 @@ class DiscordAdapter(BasePlatformAdapter):
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        # Process-local tool-name accumulator for the closed BXR Discord
+        # lane.  Raw request/response content is never placed here.
+        self._bxr_invoked_tools: Dict[str, set[str]] = {}
+
+    def _bxr_operator_policy(self) -> Optional[Dict[str, Any]]:
+        """Return the explicit closed BXR ingress policy, if enabled."""
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        if not isinstance(extra, dict):
+            return None
+        policy = extra.get("bxr_operator_ingress")
+        if not isinstance(policy, dict) or policy.get("enabled") is not True:
+            return None
+        return policy
+
+    def _bxr_operator_policy_error(self) -> Optional[str]:
+        """Validate the entire BXR profile contract without reading secrets."""
+        policy = self._bxr_operator_policy()
+        if policy is None:
+            return None
+
+        required = {
+            "enabled",
+            "profile_id",
+            "allowed_user_id",
+            "guild_id",
+            "channel_id",
+            "authority_granted",
+        }
+        if set(policy) != required:
+            return "bxr_policy_fields"
+        if policy.get("profile_id") != _BXR_DISCORD_PROFILE_ID:
+            return "bxr_profile_id"
+        if policy.get("authority_granted") is not False:
+            return "bxr_authority"
+
+        ids = []
+        for key in ("allowed_user_id", "guild_id", "channel_id"):
+            value = str(policy.get(key, "")).strip()
+            if not value.isdigit() or "*" in value or "," in value:
+                return f"bxr_{key}"
+            ids.append(value)
+        if len(set(ids)) != 3:
+            # Discord snowflakes for a user, guild, and channel are distinct.
+            return "bxr_identifier_distinctness"
+
+        extra = self.config.extra
+        exact_sets = {
+            "allow_from": {ids[0]},
+            "allowed_channels": {ids[2]},
+        }
+        for key, expected in exact_sets.items():
+            if self._gate_csv_set(extra.get(key)) != expected:
+                return f"bxr_{key}"
+        if self._gate_csv_set(extra.get("allowed_roles")):
+            return "bxr_roles"
+        if self._gate_csv_set(extra.get("free_response_channels")):
+            return "bxr_free_response"
+
+        required_false = (
+            "allow_all_users",
+            "auto_thread",
+            "reactions",
+            "slash_commands",
+            "history_backfill",
+            "missed_message_backfill",
+            "allow_any_attachment",
+        )
+        if any(extra.get(key) is not False for key in required_false):
+            return "bxr_disabled_surface"
+        if extra.get("require_mention") is not True:
+            return "bxr_require_mention"
+        if extra.get("thread_require_mention") is not True:
+            return "bxr_thread_require_mention"
+        if str(extra.get("allow_bots", "none")).strip().lower() != "none":
+            return "bxr_bot_authorship"
+        if getattr(self.config, "reply_to_mode", None) != "all":
+            return "bxr_reply_mode"
+        if getattr(self.config, "home_channel", None) is not None:
+            return "bxr_home_channel"
+        if getattr(self.config, "gateway_restart_notification", True) is not False:
+            return "bxr_restart_notification"
+        if getattr(self.config, "typing_indicator", True) is not False:
+            return "bxr_typing_indicator"
+        return None
+
+    def _bxr_origin_event_root(self) -> Optional[_Path]:
+        local_app_data = str(os.getenv("LOCALAPPDATA", "")).strip()
+        if not local_app_data:
+            return None
+        return (
+            _Path(local_app_data)
+            / "BXR"
+            / "state"
+            / "operator-origin"
+            / "discord"
+            / "events"
+            / "sha256"
+        )
+
+    @staticmethod
+    def _bxr_event_timestamp(message: Any) -> str:
+        value = getattr(message, "created_at", None)
+        if isinstance(value, dt.datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=dt.timezone.utc)
+            return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _bxr_origin_metadata(self, message: Any) -> Dict[str, str]:
+        channel = getattr(message, "channel", None)
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        parent_id = self._get_parent_channel_id(channel)
+        return {
+            "user_id": str(getattr(getattr(message, "author", None), "id", "") or ""),
+            "guild_id": str(getattr(guild, "id", "") or ""),
+            "channel_id": str(getattr(channel, "id", "") or ""),
+            "parent_channel_id": str(parent_id or ""),
+            "message_id": str(getattr(message, "id", "") or ""),
+        }
+
+    def _write_bxr_origin_event(
+        self,
+        message: Any,
+        *,
+        status: str,
+        reason: str,
+        normalized_length: int = 0,
+        invoked_tools: Optional[List[str]] = None,
+        reserve_after: int = 0,
+    ) -> Optional[str]:
+        """Write one immutable metadata-only BXR origin event.
+
+        The filename is the SHA-256 of canonical event bytes.  No request or
+        response content (and no content-derived hash) is present in the event.
+        The 4096-event ceiling is checked under a process lock and fails closed.
+        """
+        root = self._bxr_origin_event_root()
+        if root is None:
+            return None
+        metadata = self._bxr_origin_metadata(message)
+        event = {
+            "schema_version": "1",
+            "transport": "discord",
+            "profile_id": _BXR_DISCORD_PROFILE_ID,
+            "recorded_at": self._bxr_event_timestamp(message),
+            "status": status,
+            "reason": reason,
+            "actor": {"user_id": metadata["user_id"]},
+            "origin": {
+                "guild_id": metadata["guild_id"],
+                "channel_id": metadata["channel_id"],
+                "parent_channel_id": metadata["parent_channel_id"],
+                "message_id": metadata["message_id"],
+            },
+            "input": {
+                "message_type": "TEXT",
+                "normalized_length": int(normalized_length),
+            },
+            "invoked_bxr_tools": sorted(set(invoked_tools or [])),
+            "authority_granted": False,
+        }
+        payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        event_id = hashlib.sha256(payload).hexdigest()
+        target = root / f"{event_id}.json"
+        try:
+            with _BXR_DISCORD_EVENT_WRITE_LOCK:
+                root.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    return event_id if target.read_bytes() == payload else None
+                count = sum(
+                    1 for path in root.iterdir()
+                    if path.is_file() and path.suffix == ".json"
+                )
+                if count >= (_BXR_DISCORD_EVENT_LIMIT - max(0, int(reserve_after))):
+                    return None
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                fd = os.open(str(target), flags, 0o600)
+                try:
+                    with os.fdopen(fd, "wb", closefd=False) as handle:
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                finally:
+                    os.close(fd)
+            return event_id
+        except (OSError, ValueError):
+            return None
+
+    def _bxr_note_tool(self, source: Any, tool_name: str) -> bool:
+        if not getattr(source, "_bxr_operator_ingress", False):
+            return False
+        if tool_name not in _BXR_DISCORD_TOOL_NAMES:
+            return False
+        message_id = str(getattr(source, "message_id", "") or "")
+        if not message_id:
+            return False
+        self._bxr_invoked_tools.setdefault(message_id, set()).add(tool_name)
+        return True
+
+    def _bxr_take_tools(self, message: Any) -> List[str]:
+        message_id = str(getattr(message, "id", "") or "")
+        return sorted(self._bxr_invoked_tools.pop(message_id, set()))
 
     def _config_value(
         self, key: str, default: Any, *, env_key: Optional[str] = None
@@ -1225,6 +1443,16 @@ class DiscordAdapter(BasePlatformAdapter):
             self._set_fatal_error("missing_dependency", "discord.py not installed", retryable=False)
             return False
 
+        bxr_policy_error = self._bxr_operator_policy_error()
+        if bxr_policy_error is not None:
+            logger.error("[%s] Closed BXR Discord profile validation failed: %s", self.name, bxr_policy_error)
+            self._set_fatal_error(
+                "invalid_bxr_operator_ingress",
+                "Closed BXR Discord profile validation failed",
+                retryable=False,
+            )
+            return False
+
         # Load opus codec for voice channel support
         if not discord.opus.is_loaded():
             import ctypes.util
@@ -1288,7 +1516,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # unless it is actually necessary.
             intents = Intents.default()
             intents.message_content = True
-            intents.dm_messages = True
+            intents.dm_messages = self._bxr_operator_policy() is None
             intents.guild_messages = True
             intents.members = (
                 # ``"*"`` is the open-mode wildcard (honored in _is_allowed_user),
@@ -1299,7 +1527,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 any(entry != "*" and not entry.isdigit() for entry in self._allowed_user_ids)
                 or bool(self._allowed_role_ids)  # Need members intent for role lookup
             )
-            intents.voice_states = True
+            intents.voice_states = self._bxr_operator_policy() is None
 
             # Resolve proxy (DISCORD_PROXY > generic env vars > macOS system proxy)
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_bot
@@ -1429,6 +1657,62 @@ class DiscordAdapter(BasePlatformAdapter):
             self._release_platform_lock()
             return False
 
+    def _bxr_operator_preflight(self, message: Any) -> tuple[bool, str, str]:
+        """Return strict BXR ingress admission and normalized text."""
+        policy = self._bxr_operator_policy()
+        if policy is None:
+            return False, "BXR_POLICY_DISABLED", ""
+        if self._bxr_operator_policy_error() is not None:
+            return False, "BXR_POLICY_INVALID", ""
+
+        author = getattr(message, "author", None)
+        channel = getattr(message, "channel", None)
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        if author is None or getattr(author, "bot", False):
+            return False, "BOT_AUTHOR", ""
+        if str(getattr(author, "id", "") or "") != str(policy["allowed_user_id"]):
+            return False, "USER_NOT_ALLOWLISTED", ""
+        if isinstance(channel, discord.DMChannel) or guild is None:
+            return False, "DM_PROHIBITED", ""
+        if str(getattr(guild, "id", "") or "") != str(policy["guild_id"]):
+            return False, "GUILD_NOT_ALLOWLISTED", ""
+
+        parent_id = self._get_parent_channel_id(channel)
+        is_thread = isinstance(channel, discord.Thread)
+        admitted_channel_id = str(parent_id if is_thread else getattr(channel, "id", "") or "")
+        if admitted_channel_id != str(policy["channel_id"]):
+            return False, "CHANNEL_NOT_ALLOWLISTED", ""
+        if not self._self_is_explicitly_mentioned(message):
+            return False, "EXPLICIT_MENTION_REQUIRED", ""
+
+        # Reject every non-text input before any attachment fetch, history
+        # backfill, voice/transcription, or document cache path can run.
+        if list(getattr(message, "attachments", []) or []):
+            return False, "ATTACHMENT_PROHIBITED", ""
+        if list(getattr(message, "message_snapshots", []) or []):
+            return False, "SNAPSHOT_PROHIBITED", ""
+        if list(getattr(message, "stickers", []) or []):
+            return False, "STICKER_PROHIBITED", ""
+        if list(getattr(message, "embeds", []) or []):
+            return False, "EMBED_PROHIBITED", ""
+        reference = getattr(message, "reference", None)
+        resolved = getattr(reference, "resolved", None) if reference else None
+        if list(getattr(resolved, "attachments", []) or []):
+            return False, "REFERENCED_ATTACHMENT_PROHIBITED", ""
+
+        content = str(getattr(message, "content", "") or "").strip()
+        bot_id = str(getattr(getattr(self._client, "user", None), "id", "") or "")
+        if not bot_id:
+            return False, "BOT_ID_UNAVAILABLE", ""
+        normalized = re.sub(rf"<@!?{re.escape(bot_id)}>", "", content).strip()
+        if not normalized:
+            return False, "EMPTY_TEXT", ""
+        if normalized.startswith("/"):
+            return False, "SLASH_COMMAND_PROHIBITED", ""
+        if len(normalized) > _BXR_DISCORD_INPUT_LIMIT:
+            return False, "INPUT_TOO_LONG", ""
+        return True, "ADMITTED", normalized
+
     def _discord_message_admission(
         self,
         message: Any,
@@ -1442,6 +1726,32 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
         elif self._dedup.contains(message_id):
             return False, False
+
+        if self._bxr_operator_policy() is not None:
+            if message.author == self._client.user:
+                self._write_bxr_origin_event(
+                    message,
+                    status="DENIED",
+                    reason="BOT_SELF",
+                )
+                return False, False
+            if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+                self._write_bxr_origin_event(
+                    message,
+                    status="DENIED",
+                    reason="MESSAGE_TYPE_PROHIBITED",
+                )
+                return False, False
+            admitted, reason, normalized = self._bxr_operator_preflight(message)
+            if not admitted:
+                self._write_bxr_origin_event(
+                    message,
+                    status="DENIED",
+                    reason=reason,
+                    normalized_length=len(normalized),
+                )
+            return admitted, False
+
         if message.author == self._client.user:
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
@@ -2106,6 +2416,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _missed_message_backfill_enabled(self) -> bool:
         """Whether to reconcile Discord messages missed while the gateway was down."""
+        if self._bxr_operator_policy() is not None:
+            return False
         configured = self.config.extra.get("missed_message_backfill")
         if isinstance(configured, dict) and "enabled" in configured:
             value = configured["enabled"]
@@ -3050,6 +3362,11 @@ class DiscordAdapter(BasePlatformAdapter):
         Forum channels (type 15) reject direct messages — a thread post is
         created automatically.
         """
+        if self._bxr_operator_policy() is not None:
+            return SendResult(
+                success=False,
+                error="Closed BXR profile permits only origin-anchored replies",
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not (content or "").strip():
@@ -7657,6 +7974,179 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
 
+    async def _handle_bxr_operator_message(self, message: Any) -> bool:
+        """Build and dispatch one strictly admitted BXR text event."""
+        admitted, reason, normalized = self._bxr_operator_preflight(message)
+        if not admitted:
+            self._write_bxr_origin_event(
+                message,
+                status="DENIED",
+                reason=reason,
+                normalized_length=len(normalized),
+            )
+            return False
+
+        channel = message.channel
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        is_thread = isinstance(channel, discord.Thread)
+        parent_id = self._get_parent_channel_id(channel)
+        source = self.build_source(
+            chat_id=str(channel.id),
+            chat_type="thread" if is_thread else "group",
+            user_id=str(message.author.id),
+            thread_id=str(channel.id) if is_thread else None,
+            guild_id=str(guild.id),
+            parent_chat_id=parent_id,
+            message_id=str(message.id),
+            role_authorized=False,
+        )
+        if getattr(source, "profile", None) != _BXR_DISCORD_PROFILE_ID:
+            self._write_bxr_origin_event(
+                message,
+                status="DENIED",
+                reason="PROFILE_ROUTE_MISMATCH",
+                normalized_length=len(normalized),
+            )
+            return False
+
+        setattr(source, "_bxr_operator_ingress", True)
+        admitted_event_id = self._write_bxr_origin_event(
+            message,
+            status="ADMITTED",
+            reason="POLICY_MATCH",
+            normalized_length=len(normalized),
+            reserve_after=1,
+        )
+        if admitted_event_id is None:
+            return False
+
+        event = MessageEvent(
+            text=normalized,
+            message_type=MessageType.TEXT,
+            user_id=str(message.author.id),
+            source=source,
+            raw_message=message,
+            message_id=str(message.id),
+            timestamp=getattr(message, "created_at", dt.datetime.now(dt.timezone.utc)),
+            metadata={
+                "bxr_operator_ingress": True,
+                "origin_event_id": admitted_event_id,
+                "authority_granted": False,
+            },
+        )
+        await self.handle_message(event)
+        return True
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Use a no-merge, no-command dispatch rail for BXR origin events."""
+        if not (getattr(event, "metadata", None) or {}).get("bxr_operator_ingress"):
+            return await super().handle_message(event)
+        if not self._message_handler:
+            return
+        from gateway.session import build_session_key
+
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=True,
+        )
+        if session_key in self._active_sessions:
+            self._write_bxr_origin_event(
+                event.raw_message,
+                status="DENIED",
+                reason="SESSION_BUSY",
+                normalized_length=len(event.text or ""),
+            )
+            return
+        self._start_session_processing(event, session_key)
+
+    async def _send_bxr_operator_reply(self, event: MessageEvent, content: str) -> SendResult:
+        """Send bounded text chunks, each anchored to the exact origin."""
+        if not isinstance(content, str) or not content.strip():
+            return SendResult(success=False, error="Empty BXR response")
+        if utf16_len(content) > _BXR_DISCORD_OUTPUT_LIMIT:
+            return SendResult(success=False, error="BXR response exceeds total bound")
+        raw_message = event.raw_message
+        channel = getattr(raw_message, "channel", None)
+        if channel is None or str(getattr(channel, "id", "")) != str(event.source.chat_id):
+            return SendResult(success=False, error="BXR origin channel mismatch")
+        chunks: List[str] = []
+        remaining = content
+        while remaining:
+            chunk = _prefix_within_utf16_limit(remaining, self.MAX_MESSAGE_LENGTH)
+            if not chunk:
+                return SendResult(success=False, error="BXR response cannot be bounded")
+            chunks.append(chunk)
+            remaining = remaining[len(chunk):]
+        if not chunks or len(chunks) > _BXR_DISCORD_OUTPUT_MESSAGES:
+            return SendResult(success=False, error="BXR response message-count bound exceeded")
+        try:
+            reference = discord.MessageReference(
+                message_id=int(event.message_id),
+                channel_id=int(event.source.chat_id),
+                guild_id=int(event.source.guild_id),
+                fail_if_not_exists=True,
+            )
+        except (TypeError, ValueError, AttributeError):
+            return SendResult(success=False, error="BXR reply anchor unavailable")
+
+        message_ids: List[str] = []
+        try:
+            for chunk in chunks:
+                sent = await channel.send(content=chunk, reference=reference)
+                message_ids.append(str(sent.id))
+        except Exception:
+            # Never retry without the reference and never fall back to an
+            # unanchored or arbitrary channel send.
+            return SendResult(success=False, error="BXR anchored delivery failed")
+        return SendResult(
+            success=True,
+            message_id=message_ids[0],
+            raw_response={"message_ids": message_ids},
+        )
+
+    async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+        """Bypass generic transcript/media/proactive delivery for BXR turns."""
+        if not (getattr(event, "metadata", None) or {}).get("bxr_operator_ingress"):
+            return await super()._process_message_background(event, session_key)
+
+        guard = self._active_sessions.get(session_key) or asyncio.Event()
+        self._active_sessions[session_key] = guard
+        outcome = "PROCESSING_FAILED"
+        result = SendResult(success=False, error="BXR response unavailable")
+        try:
+            response = await self._message_handler(event)
+            if isinstance(response, str) and response:
+                result = await self._send_bxr_operator_reply(event, response)
+                outcome = "COMPLETED" if result.success else "DELIVERY_FAILED"
+            else:
+                outcome = "EMPTY_RESPONSE"
+        except asyncio.CancelledError:
+            outcome = "CANCELLED"
+            raise
+        except Exception:
+            # Do not expose provider/runtime details and do not use the generic
+            # unanchored error-notice fallback.
+            outcome = "PROCESSING_FAILED"
+        finally:
+            tools = self._bxr_take_tools(event.raw_message)
+            self._write_bxr_origin_event(
+                event.raw_message,
+                status="COMPLETED" if result.success else "FAILED",
+                reason=outcome,
+                normalized_length=len(event.text or ""),
+                invoked_tools=tools,
+            )
+            runner = getattr(self, "gateway_runner", None)
+            if runner is not None:
+                try:
+                    runner._evict_cached_agent(session_key)
+                except Exception:
+                    pass
+            self._pending_messages.pop(session_key, None)
+            self._session_tasks.pop(session_key, None)
+            self._release_session_guard(session_key, guard=guard)
+
     async def _handle_message(
         self,
         message: DiscordMessage,
@@ -7665,6 +8155,8 @@ class DiscordAdapter(BasePlatformAdapter):
         recovered: bool = False,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
+        if self._bxr_operator_policy() is not None:
+            return await self._handle_bxr_operator_message(message)
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list or the message is
         # in a thread where the bot has already participated.

@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
+import socket
 import sys
 
 import pytest
@@ -49,6 +50,49 @@ import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def deny_network(monkeypatch):
+    attempts = []
+    original_create_connection = socket.create_connection
+    original_getaddrinfo = socket.getaddrinfo
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+
+    def is_loopback(address):
+        return isinstance(address, tuple) and str(address[0]) in {"127.0.0.1", "::1"}
+
+    def denied(*args, **kwargs):
+        attempts.append((args, kwargs))
+        raise AssertionError("offline BXR Hermes test attempted network access")
+
+    def guarded_create_connection(address, *args, **kwargs):
+        if is_loopback(address):
+            return original_create_connection(address, *args, **kwargs)
+        return denied(address, *args, **kwargs)
+
+    def guarded_getaddrinfo(host, *args, **kwargs):
+        if str(host) in {"127.0.0.1", "::1", "localhost"}:
+            return original_getaddrinfo(host, *args, **kwargs)
+        return denied(host, *args, **kwargs)
+
+    def guarded_connect(sock, address):
+        if is_loopback(address):
+            return original_connect(sock, address)
+        return denied(sock, address)
+
+    def guarded_connect_ex(sock, address):
+        if is_loopback(address):
+            return original_connect_ex(sock, address)
+        return denied(sock, address)
+
+    monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    yield
+    assert attempts == []
+
+
 class FakeDMChannel:
     def __init__(self, channel_id: int = 1, name: str = "dm"):
         self.id = channel_id
@@ -56,10 +100,10 @@ class FakeDMChannel:
 
 
 class FakeTextChannel:
-    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server"):
+    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server", guild_id: int = 100):
         self.id = channel_id
         self.name = name
-        self.guild = SimpleNamespace(name=guild_name)
+        self.guild = SimpleNamespace(name=guild_name, id=guild_id)
         self.topic = None
 
 
@@ -87,16 +131,55 @@ def adapter(monkeypatch):
 
 
 def make_message(*, channel, content: str, mentions=None):
-    author = SimpleNamespace(id=42, display_name="TestUser", name="TestUser")
+    author = SimpleNamespace(id=42, display_name="TestUser", name="TestUser", bot=False)
     return SimpleNamespace(
         id=123,
         content=content,
         mentions=list(mentions or []),
         attachments=[],
+        message_snapshots=[],
+        stickers=[],
+        embeds=[],
         reference=None,
         created_at=datetime.now(timezone.utc),
         channel=channel,
+        guild=getattr(channel, "guild", None),
         author=author,
+        type=discord_platform.discord.MessageType.default,
+    )
+
+
+def bxr_config():
+    return PlatformConfig(
+        enabled=True,
+        token="fixture-token",
+        reply_to_mode="all",
+        gateway_restart_notification=False,
+        typing_indicator=False,
+        extra={
+            "bxr_operator_ingress": {
+                "enabled": True,
+                "profile_id": "bxr-operator",
+                "allowed_user_id": "42",
+                "guild_id": "100",
+                "channel_id": "800",
+                "authority_granted": False,
+            },
+            "allow_from": ["42"],
+            "allowed_channels": ["800"],
+            "allowed_roles": [],
+            "free_response_channels": [],
+            "allow_all_users": False,
+            "auto_thread": False,
+            "reactions": False,
+            "slash_commands": False,
+            "history_backfill": False,
+            "missed_message_backfill": False,
+            "allow_any_attachment": False,
+            "require_mention": True,
+            "thread_require_mention": True,
+            "allow_bots": "none",
+        },
     )
 
 
@@ -240,3 +323,185 @@ def test_config_bridges_ignored_channels(monkeypatch, tmp_path):
     assert os.getenv("DISCORD_IGNORED_CHANNELS") == "111,222"
 
 
+@pytest.fixture
+def bxr_adapter(monkeypatch, tmp_path):
+    monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
+    monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    instance = DiscordAdapter(bxr_config())
+    bot = SimpleNamespace(id=999, bot=True)
+    instance._client = SimpleNamespace(user=bot)
+    return instance
+
+
+def test_bxr_policy_is_closed_and_rejects_wildcards_and_roles(bxr_adapter):
+    assert bxr_adapter._bxr_operator_policy_error() is None
+
+    bxr_adapter.config.extra["allowed_channels"] = ["*"]
+    assert bxr_adapter._bxr_operator_policy_error() == "bxr_allowed_channels"
+    bxr_adapter.config.extra["allowed_channels"] = ["800"]
+
+    bxr_adapter.config.extra["allowed_roles"] = ["55"]
+    assert bxr_adapter._bxr_operator_policy_error() == "bxr_roles"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (lambda message, bot: setattr(message.author, "id", 43), "USER_NOT_ALLOWLISTED"),
+        (lambda message, bot: setattr(message.guild, "id", 101), "GUILD_NOT_ALLOWLISTED"),
+        (lambda message, bot: setattr(message.channel, "id", 801), "CHANNEL_NOT_ALLOWLISTED"),
+        (
+            lambda message, bot: (
+                setattr(message, "mentions", []),
+                setattr(message, "content", "BXR status"),
+            ),
+            "EXPLICIT_MENTION_REQUIRED",
+        ),
+        (lambda message, bot: message.attachments.append(SimpleNamespace()), "ATTACHMENT_PROHIBITED"),
+        (lambda message, bot: message.message_snapshots.append(SimpleNamespace()), "SNAPSHOT_PROHIBITED"),
+        (lambda message, bot: setattr(message, "content", f"<@{bot.id}> /status"), "SLASH_COMMAND_PROHIBITED"),
+        (lambda message, bot: setattr(message, "content", f"<@{bot.id}> " + "x" * 1001), "INPUT_TOO_LONG"),
+    ],
+)
+def test_bxr_ingress_denies_every_nonmatching_origin_or_shape(bxr_adapter, mutation, reason):
+    bot = bxr_adapter._client.user
+    message = make_message(
+        channel=FakeTextChannel(channel_id=800),
+        content=f"<@{bot.id}> BXR status",
+        mentions=[bot],
+    )
+    mutation(message, bot)
+    admitted, observed_reason, _ = bxr_adapter._bxr_operator_preflight(message)
+    assert admitted is False
+    assert observed_reason == reason
+
+
+def test_bxr_admission_records_self_and_nontext_denials(bxr_adapter):
+    bot = bxr_adapter._client.user
+    message = make_message(
+        channel=FakeTextChannel(channel_id=800),
+        content=f"<@{bot.id}> BXR status",
+        mentions=[bot],
+    )
+    bxr_adapter._write_bxr_origin_event = MagicMock(return_value="event-id")
+
+    message.author = bot
+    assert bxr_adapter._discord_message_admission(message, claim=False) == (False, False)
+    assert bxr_adapter._write_bxr_origin_event.call_args.kwargs["reason"] == "BOT_SELF"
+
+    message.author = SimpleNamespace(id=42, bot=False)
+    message.type = object()
+    assert bxr_adapter._discord_message_admission(message, claim=False) == (False, False)
+    assert (
+        bxr_adapter._write_bxr_origin_event.call_args.kwargs["reason"]
+        == "MESSAGE_TYPE_PROHIBITED"
+    )
+
+
+def test_bxr_thread_requires_mention_and_exact_parent_channel(bxr_adapter):
+    bot = bxr_adapter._client.user
+    parent = FakeTextChannel(channel_id=800)
+    thread = FakeThread(channel_id=900, parent=parent)
+    message = make_message(channel=thread, content=f"<@{bot.id}> Continue BXR", mentions=[bot])
+
+    admitted, reason, normalized = bxr_adapter._bxr_operator_preflight(message)
+    assert (admitted, reason, normalized) == (True, "ADMITTED", "Continue BXR")
+
+    message.mentions = []
+    message.content = "Continue BXR"
+    assert bxr_adapter._bxr_operator_preflight(message)[1] == "EXPLICIT_MENTION_REQUIRED"
+
+
+def test_bxr_origin_event_is_content_free_immutable_and_bounded(bxr_adapter, monkeypatch, tmp_path):
+    bot = bxr_adapter._client.user
+    secret_text = "request text that must never persist"
+    message = make_message(
+        channel=FakeTextChannel(channel_id=800),
+        content=f"<@{bot.id}> {secret_text}",
+        mentions=[bot],
+    )
+    event_id = bxr_adapter._write_bxr_origin_event(
+        message,
+        status="ADMITTED",
+        reason="POLICY_MATCH",
+        normalized_length=len(secret_text),
+        reserve_after=1,
+    )
+    assert event_id is not None
+    root = bxr_adapter._bxr_origin_event_root()
+    stored = (root / f"{event_id}.json").read_text(encoding="utf-8")
+    assert secret_text not in stored
+    assert "content" not in stored
+    assert "hash" not in stored
+    assert bxr_adapter._write_bxr_origin_event(
+        message,
+        status="ADMITTED",
+        reason="POLICY_MATCH",
+        normalized_length=len(secret_text),
+        reserve_after=1,
+    ) == event_id
+
+    monkeypatch.setattr(discord_platform, "_BXR_DISCORD_EVENT_LIMIT", 1)
+    message.id = 124
+    assert bxr_adapter._write_bxr_origin_event(
+        message,
+        status="DENIED",
+        reason="TEST_BOUND",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_bxr_reply_is_bounded_and_every_chunk_is_anchored(bxr_adapter, monkeypatch):
+    channel = FakeTextChannel(channel_id=800)
+    channel.send = AsyncMock(side_effect=[SimpleNamespace(id=index) for index in range(1, 5)])
+    source = SimpleNamespace(chat_id="800", guild_id="100")
+    event = SimpleNamespace(
+        raw_message=SimpleNamespace(channel=channel),
+        source=source,
+        message_id="123",
+    )
+    reference = object()
+    monkeypatch.setattr(discord_platform.discord, "MessageReference", MagicMock(return_value=reference))
+
+    result = await bxr_adapter._send_bxr_operator_reply(event, "x" * 8000)
+    assert result.success is True
+    assert channel.send.await_count == 4
+    assert all(call.kwargs["reference"] is reference for call in channel.send.await_args_list)
+    assert all(len(call.kwargs["content"]) <= 2000 for call in channel.send.await_args_list)
+
+    channel.send.reset_mock()
+    assert not (await bxr_adapter._send_bxr_operator_reply(event, "x" * 8001)).success
+    channel.send.assert_not_awaited()
+
+    # Discord's platform limit is UTF-16 units, not Python code points.
+    channel.send.side_effect = [SimpleNamespace(id=index) for index in range(5, 9)]
+    emoji_result = await bxr_adapter._send_bxr_operator_reply(event, "\U0001f600" * 4000)
+    assert emoji_result.success
+    assert channel.send.await_count == 4
+    for call in channel.send.await_args_list:
+        assert discord_platform.utf16_len(call.kwargs["content"]) == 2000
+
+
+@pytest.mark.asyncio
+async def test_bxr_reply_anchor_failure_has_no_unanchored_fallback(bxr_adapter, monkeypatch):
+    channel = FakeTextChannel(channel_id=800)
+    channel.send = AsyncMock(side_effect=RuntimeError("unknown message"))
+    event = SimpleNamespace(
+        raw_message=SimpleNamespace(channel=channel),
+        source=SimpleNamespace(chat_id="800", guild_id="100"),
+        message_id="123",
+    )
+    monkeypatch.setattr(discord_platform.discord, "MessageReference", MagicMock(return_value=object()))
+
+    result = await bxr_adapter._send_bxr_operator_reply(event, "BXR status")
+    assert result.success is False
+    assert channel.send.await_count == 1
+    assert channel.send.await_args.kwargs["reference"] is not None
+
+
+@pytest.mark.asyncio
+async def test_bxr_generic_send_rail_is_closed(bxr_adapter):
+    result = await bxr_adapter.send("800", "proactive message")
+    assert result.success is False
+    assert "origin-anchored" in result.error

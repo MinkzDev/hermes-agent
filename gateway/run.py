@@ -151,6 +151,86 @@ _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
 # retry is cheap and still recovers within a session.
 _HYGIENE_COOLDOWN_MAX_SECONDS = 3600.0
 
+_BXR_OPERATOR_PROFILE_ID = "bxr-operator"
+_BXR_OPERATOR_DISCORD_TOOLS = frozenset({
+    "mcp__bxr_operator__bxr_status",
+    "mcp__bxr_operator__bxr_route",
+    "mcp__bxr_operator__bxr_continue_plan",
+})
+
+
+def _is_bxr_operator_discord_source(source: Any) -> bool:
+    """Identify the explicit closed BXR Discord lane without env state."""
+    platform = getattr(source, "platform", None)
+    platform_value = getattr(platform, "value", platform)
+    return bool(
+        str(platform_value).lower() == "discord"
+        and getattr(source, "profile", None) == _BXR_OPERATOR_PROFILE_ID
+        and getattr(source, "_bxr_operator_ingress", False)
+    )
+
+
+def _gateway_tool_definition_names(definitions: Any) -> set[str]:
+    """Extract callable names from common OpenAI/Anthropic tool shapes."""
+    names: set[str] = set()
+    for definition in definitions or []:
+        if not isinstance(definition, dict):
+            continue
+        name = definition.get("name")
+        if not name and isinstance(definition.get("function"), dict):
+            name = definition["function"].get("name")
+        if name:
+            names.add(str(name))
+    return names
+
+
+def _bxr_operator_tool_surface_is_exact(definitions: Any) -> bool:
+    return _gateway_tool_definition_names(definitions) == _BXR_OPERATOR_DISCORD_TOOLS
+
+
+def _bxr_invoked_tool_names(messages: Any) -> list[str]:
+    names: set[str] = set()
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            name = function.get("name") if isinstance(function, dict) else call.get("name")
+            if name in _BXR_OPERATOR_DISCORD_TOOLS:
+                names.add(str(name))
+    return sorted(names)
+
+
+def _bxr_operator_session_metadata(source: Any, event: Any, invoked_tools: Any) -> dict:
+    """Build the closed, content-free durable session row for one BXR turn."""
+    event_time = getattr(event, "timestamp", None)
+    event_time_text = (
+        event_time.isoformat()
+        if hasattr(event_time, "isoformat")
+        else str(event_time or "")
+    )
+    return {
+        "role": "session_meta",
+        "event": "bxr_discord_operator_turn",
+        "profile": _BXR_OPERATOR_PROFILE_ID,
+        "actor": {"user_id": str(getattr(source, "user_id", "") or "")},
+        "origin": {
+            "guild_id": str(getattr(source, "guild_id", "") or ""),
+            "channel_id": str(getattr(source, "chat_id", "") or ""),
+            "parent_channel_id": str(getattr(source, "parent_chat_id", "") or ""),
+            "message_id": str(getattr(event, "message_id", "") or ""),
+        },
+        "received_at": event_time_text,
+        "recorded_at": time.time(),
+        "admission": "ADMITTED",
+        "invoked_bxr_tools": sorted(
+            set(invoked_tools or []) & _BXR_OPERATOR_DISCORD_TOOLS
+        ),
+        "authority_granted": False,
+    }
+
 
 def _hygiene_cooldown_for_failure(
     gateway,
@@ -3813,6 +3893,16 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if _is_bxr_operator_discord_source(ctx.source):
+            # Preserve only the closed BXR tool identity in the adapter's
+            # metadata ledger. Never emit progress messages/log entries or
+            # persist argument/preview content for this profile.
+            if event_type == "tool.started" and tool_name:
+                adapter = self._runner._adapter_for_source(ctx.source)
+                note_tool = getattr(adapter, "_bxr_note_tool", None)
+                if callable(note_tool):
+                    note_tool(ctx.source, tool_name)
+            return
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
@@ -5005,10 +5095,17 @@ class TurnRunner:
                 chat_type=ctx.source.chat_type,
                 thread_id=ctx.source.thread_id,
                 gateway_session_key=ctx.session_key,
-                session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
+                session_db=(
+                    None
+                    if _bxr_closed_lane
+                    else getattr(self._runner._session_db, "_db", self._runner._session_db)
+                ),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
                 fallback_model=self._runner._refresh_fallback_model(),
-                skip_context_files=skip_context_files,
+                skip_context_files=True if _bxr_closed_lane else skip_context_files,
+                skip_memory=_bxr_closed_lane,
+                skip_background_review=_bxr_closed_lane,
+                save_trajectories=False,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
@@ -5025,6 +5122,10 @@ class TurnRunner:
                     )
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+
+        if _bxr_closed_lane:
+            if not _bxr_operator_tool_surface_is_exact(getattr(agent, "tools", [])):
+                raise RuntimeError("Closed BXR Discord tool surface mismatch")
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -5054,6 +5155,13 @@ class TurnRunner:
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
+        if _bxr_closed_lane:
+            agent.tool_progress_callback = None
+            agent.tool_start_callback = None
+            agent.step_callback = None
+            agent.stream_delta_callback = None
+            agent.interim_assistant_callback = None
+            agent.status_callback = None
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
         # standalone push: render to a single plaintext line and deliver via
@@ -5083,9 +5191,9 @@ class TurnRunner:
                 log_message="notice_callback delivery scheduling error",
             )
 
-        agent.notice_callback = _notice_callback_sync
+        agent.notice_callback = None if _bxr_closed_lane else _notice_callback_sync
         agent.notice_clear_callback = None
-        agent.event_callback = ctx._event_callback_sync
+        agent.event_callback = None if _bxr_closed_lane else ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
@@ -5135,10 +5243,10 @@ class TurnRunner:
                         return
             _deliver_bg_review_message(message)
 
-        agent.background_review_callback = _bg_review_send
+        agent.background_review_callback = None if _bxr_closed_lane else _bg_review_send
         # Register the release hook on the adapter so base.py's finally
         # block can fire it after delivering the main response.
-        if ctx._status_adapter and ctx.session_key:
+        if ctx._status_adapter and ctx.session_key and not _bxr_closed_lane:
             if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
                 ctx._status_adapter.register_post_delivery_callback(
                     ctx.session_key,
@@ -5156,7 +5264,11 @@ class TurnRunner:
         _mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
         if isinstance(_mem_notif, bool):
             _mem_notif = "on" if _mem_notif else "off"
-        agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
+        agent.memory_notifications = (
+            "off"
+            if _bxr_closed_lane
+            else (str(_mem_notif).lower() if _mem_notif else "on")
+        )
 
         # ------------------------------------------------------------------
         # Clarify callback: present a clarify prompt and block on a response.
@@ -5251,12 +5363,12 @@ class TurnRunner:
                 return f"[user did not respond within {int(timeout / 60)}m]"
             return response
 
-        agent.clarify_callback = _clarify_callback_sync
+        agent.clarify_callback = None if _bxr_closed_lane else _clarify_callback_sync
 
         # Show assistant thinking between tool calls — independent of
         # tool_progress mode. Mattermost needs an explicit per-platform
         # opt-in so global scratch-text display does not leak into threads.
-        agent.thinking_progress = ctx._thinking_enabled
+        agent.thinking_progress = False if _bxr_closed_lane else ctx._thinking_enabled
         # Store agent reference for interrupt support
         ctx.agent_holder[0] = agent
         # Wire the platform thread-rename lane onto the agent, because the
@@ -16946,10 +17058,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _bxr_metadata_only = _is_bxr_operator_discord_source(source)
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = "<metadata-only>" if _bxr_metadata_only else (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
-        _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        _reply_txt = "<metadata-only>" if _bxr_metadata_only else (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
@@ -17074,7 +17187,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
             session_entry.is_fresh_reset = False
-        if _is_new_session:
+        if _is_new_session and not _bxr_metadata_only:
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -17280,6 +17393,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
+        if _bxr_metadata_only:
+            # BXR Discord turns never replay a raw chat transcript.  Existing
+            # metadata rows remain durable evidence but are not model context.
+            history = []
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -18151,12 +18268,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
-        message_text = await self._prepare_profile_scoped_inbound_message_text(
-            event=event,
-            source=source,
-            history=history,
-            session_key=session_key,
-        )
+        if _bxr_metadata_only:
+            # The adapter has already admitted and bounded closed text. Avoid
+            # every generic media, transcription, @path expansion, and source
+            # hydration path for this read-only operator profile.
+            message_text = str(event.text or "")
+        else:
+            message_text = await self._prepare_profile_scoped_inbound_message_text(
+                event=event,
+                source=source,
+                history=history,
+                session_key=session_key,
+            )
         if message_text is None:
             return
 
@@ -18223,7 +18346,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
             }
-            await self.hooks.emit("agent:start", hook_ctx)
+            if not _bxr_metadata_only:
+                await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent. Capture the session id that this run was launched
             # against so post-run compression publication can be identity-guarded
@@ -18314,6 +18438,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
+            _bxr_invoked_tools = _bxr_invoked_tool_names(agent_messages)
+            if _bxr_metadata_only:
+                _bxr_adapter = self._adapter_for_source(source)
+                _bxr_note_tool = getattr(_bxr_adapter, "_bxr_note_tool", None)
+                if callable(_bxr_note_tool):
+                    for _bxr_tool_name in _bxr_invoked_tools:
+                        _bxr_note_tool(source, _bxr_tool_name)
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
@@ -18467,16 +18598,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            if (
+                not _bxr_metadata_only
+                and _footer_line
+                and response
+                and not agent_result.get("already_sent")
+                and not _intentional_silence
+            ):
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
-            await self.hooks.emit("agent:end", {
-                **hook_ctx,
-                "response": (response or "")[:500],
-                "model": agent_result.get("model", ""),
-                "provider": agent_result.get("provider", ""),
-            })
+            if not _bxr_metadata_only:
+                await self.hooks.emit("agent:end", {
+                    **hook_ctx,
+                    "response": (response or "")[:500],
+                    "model": agent_result.get("model", ""),
+                    "provider": agent_result.get("provider", ""),
+                })
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -18537,6 +18675,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the user message causes severe context loss on retry — the agent
             # forgets what was just asked.  Persist the user turn so the
             # conversation is preserved. (#7100)
+            if _bxr_metadata_only:
+                await self.async_session_store.append_to_transcript(
+                    session_entry.session_id,
+                    _bxr_operator_session_metadata(source, event, _bxr_invoked_tools),
+                )
             agent_failed_early = bool(agent_result.get("failed"))
             hidden_reasoning_incomplete = _is_gateway_hidden_reasoning_incomplete_turn(
                 agent_result
@@ -18556,6 +18699,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "payload too large", "input is too long",
                 ))
                 or ("400" in _err_str_for_classify and len(history) > 50)
+            )
+            skip_transcript_persistence = (
+                _bxr_metadata_only or is_context_overflow_failure
             )
             if is_context_overflow_failure:
                 logger.info(
@@ -18636,7 +18782,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if is_context_overflow_failure:
+            if skip_transcript_persistence:
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
                 tool_defs = agent_result.get("tools", [])
@@ -18667,7 +18813,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
-            if is_context_overflow_failure:
+            if skip_transcript_persistence:
                 pass  # handled above — skip all transcript writes
             elif agent_failed_early or hidden_reasoning_incomplete:
                 # Transient failure (429/timeout/5xx): persist only the user
@@ -18891,7 +19037,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # agent already reached its early turn-start persistence, the latest
             # transcript user row will match and we skip the duplicate.
             try:
-                if 'message_text' in locals() and message_text is not None and session_entry is not None:
+                if (
+                    not _bxr_metadata_only
+                    and 'message_text' in locals()
+                    and message_text is not None
+                    and session_entry is not None
+                ):
                     _already_persisted = False
                     try:
                         _recent_transcript = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -25376,11 +25527,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        _bxr_closed_lane = _is_bxr_operator_discord_source(source)
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        if _bxr_closed_lane:
+            enabled_toolsets = []
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -25430,6 +25584,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
+        if _bxr_closed_lane:
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
@@ -25492,6 +25648,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _live_status_adapter = None
         if _live_status_mode == "off":
             _live_status_adapter = None
+        if _bxr_closed_lane:
+            _live_status_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
@@ -25508,6 +25666,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
         )
+        if _bxr_closed_lane:
+            interim_assistant_messages_enabled = False
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
         # Mattermost requires a per-platform opt-in: global scratch-text display
@@ -25518,6 +25678,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
+        if _bxr_closed_lane:
+            _thinking_enabled = False
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
 
 
