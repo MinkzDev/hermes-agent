@@ -186,7 +186,9 @@ class _StopClosedLaneRun(RuntimeError):
     pass
 
 
-def _exercise_turn_runner_until_conversation(*, bxr_closed_lane):
+def _exercise_turn_runner_until_conversation(
+    *, bxr_closed_lane, constructor_probe=None
+):
     session_db = SimpleNamespace(marker="session-db")
     runner = MagicMock()
     runner._get_system_prompt_for_channel.return_value = None
@@ -237,6 +239,8 @@ def _exercise_turn_runner_until_conversation(*, bxr_closed_lane):
 
     class FixtureAgent:
         def __init__(self, **kwargs):
+            if constructor_probe is not None:
+                constructor_probe()
             observed["constructor"] = kwargs
             self.tools = [
                 {"name": name}
@@ -275,6 +279,57 @@ def _exercise_turn_runner_until_conversation(*, bxr_closed_lane):
     return observed, session_db
 
 
+def test_turn_runner_closed_lane_suppresses_models_dev_before_construction(
+    monkeypatch,
+):
+    from agent import models_dev
+
+    events = []
+    original_setter = models_dev.set_automatic_refresh_enabled
+
+    def record_refresh_state(enabled):
+        events.append(("automatic_refresh", enabled))
+        original_setter(enabled)
+
+    def reject_network_path(*_args, **_kwargs):
+        raise AssertionError("closed BXR lane started a models.dev network path")
+
+    def probe_model_metadata():
+        events.append(
+            (
+                "agent_construction",
+                models_dev._models_dev_automatic_refresh_enabled,
+            )
+        )
+        assert models_dev.fetch_models_dev() == {}
+
+    monkeypatch.setattr(models_dev, "_models_dev_automatic_refresh_enabled", True)
+    monkeypatch.setattr(models_dev, "_models_dev_cache", {})
+    monkeypatch.setattr(models_dev, "_load_disk_cache", lambda: {})
+    monkeypatch.setattr(
+        models_dev,
+        "_start_background_refresh_models_dev",
+        reject_network_path,
+    )
+    monkeypatch.setattr(
+        models_dev,
+        "_fetch_models_dev_from_network",
+        reject_network_path,
+    )
+    monkeypatch.setattr(models_dev, "set_automatic_refresh_enabled", record_refresh_state)
+
+    observed, _session_db = _exercise_turn_runner_until_conversation(
+        bxr_closed_lane=True,
+        constructor_probe=probe_model_metadata,
+    )
+
+    assert events == [
+        ("automatic_refresh", False),
+        ("agent_construction", False),
+    ]
+    assert _bxr_operator_tool_surface_is_exact(observed["agent"].tools) is True
+
+
 def test_turn_runner_closed_lane_applies_all_non_persistence_guards():
     observed, _session_db = _exercise_turn_runner_until_conversation(
         bxr_closed_lane=True
@@ -311,12 +366,23 @@ def test_turn_runner_closed_lane_applies_all_non_persistence_guards():
     )["authority_granted"] is False
 
 
-def test_turn_runner_non_bxr_lane_keeps_normal_persistence_configuration():
+def test_turn_runner_non_bxr_lane_keeps_normal_persistence_configuration(
+    monkeypatch,
+):
+    from agent import models_dev
+
+    refresh_calls = []
+    monkeypatch.setattr(
+        models_dev,
+        "set_automatic_refresh_enabled",
+        lambda enabled: refresh_calls.append(enabled),
+    )
     observed, session_db = _exercise_turn_runner_until_conversation(
         bxr_closed_lane=False
     )
     constructor = observed["constructor"]
 
+    assert refresh_calls == []
     assert constructor["session_db"] is session_db
     assert constructor["skip_context_files"] is False
     assert constructor["skip_memory"] is False
