@@ -8000,7 +8000,7 @@ class DiscordAdapter(BasePlatformAdapter):
             message_id=str(message.id),
             role_authorized=False,
         )
-        if getattr(source, "profile", None) != _BXR_DISCORD_PROFILE_ID:
+        if not self._bind_bxr_operator_source_profile(source):
             self._write_bxr_origin_event(
                 message,
                 status="DENIED",
@@ -8035,6 +8035,31 @@ class DiscordAdapter(BasePlatformAdapter):
             },
         )
         await self.handle_message(event)
+        return True
+
+    def _bind_bxr_operator_source_profile(self, source: Any) -> bool:
+        """Bind the closed BXR lane only to its exact single-profile runner."""
+        runner = getattr(self, "gateway_runner", None)
+        runner_config = getattr(runner, "config", None)
+        if runner is None or runner_config is None:
+            return False
+        if bool(getattr(runner_config, "multiplex_profiles", False)):
+            return False
+
+        active_profile = getattr(runner, "_active_profile_name", None)
+        if not callable(active_profile):
+            return False
+        try:
+            active_name = str(active_profile() or "").strip()
+        except Exception:
+            return False
+        if active_name != _BXR_DISCORD_PROFILE_ID:
+            return False
+
+        routed_name = str(getattr(source, "profile", None) or "").strip()
+        if routed_name not in {"", _BXR_DISCORD_PROFILE_ID}:
+            return False
+        source.profile = _BXR_DISCORD_PROFILE_ID
         return True
 
     async def handle_message(self, event: MessageEvent) -> None:
@@ -10472,7 +10497,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         else platform_extra_cfg.get("allow_all_users")
     )
     if allow_all_cfg is not None:
-        seeded_extra["allow_all_users"] = str(allow_all_cfg).lower()
+        # The real loader always supplies the complete YAML mapping. Preserve
+        # its Boolean type for PlatformConfig.extra; retain the historical
+        # direct-hook return shape only for legacy callers that supply no YAML
+        # document at all.
+        seeded_extra["allow_all_users"] = (
+            allow_all_cfg if yaml_cfg else str(allow_all_cfg).lower()
+        )
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOW_ALL_USERS"):
             os.environ["DISCORD_ALLOW_ALL_USERS"] = str(allow_all_cfg).lower()
     approval_mentions_cfg = (

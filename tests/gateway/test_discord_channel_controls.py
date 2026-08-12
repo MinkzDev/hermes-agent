@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 
 
 def _ensure_discord_mock():
@@ -323,6 +323,42 @@ def test_config_bridges_ignored_channels(monkeypatch, tmp_path):
     assert os.getenv("DISCORD_IGNORED_CHANNELS") == "111,222"
 
 
+def test_config_preserves_allow_all_users_boolean_on_real_yaml_load(monkeypatch, tmp_path):
+    """The real YAML loader keeps the closed gate typed while bridging legacy env."""
+    import os
+    import yaml
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "gateway": {
+                    "platforms": {
+                        "discord": {
+                            "enabled": True,
+                            "extra": {"allow_all_users": False},
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "")
+
+    from gateway.config import load_gateway_config
+
+    config = load_gateway_config()
+
+    assert config.platforms[Platform.DISCORD].extra["allow_all_users"] is False
+    assert (os.getenv("DISCORD_ALLOW_ALL_USERS") or "").lower() not in {
+        "true",
+        "1",
+        "yes",
+    }
+
+
 @pytest.fixture
 def bxr_adapter(monkeypatch, tmp_path):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
@@ -411,6 +447,86 @@ def test_bxr_thread_requires_mention_and_exact_parent_channel(bxr_adapter):
     message.mentions = []
     message.content = "Continue BXR"
     assert bxr_adapter._bxr_operator_preflight(message)[1] == "EXPLICIT_MENTION_REQUIRED"
+
+
+def _bxr_runner(*, active_profile="bxr-operator", multiplex_profiles=False):
+    return SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=multiplex_profiles),
+        _active_profile_name=MagicMock(return_value=active_profile),
+    )
+
+
+def _matching_bxr_message(adapter):
+    bot = adapter._client.user
+    return make_message(
+        channel=FakeTextChannel(channel_id=800),
+        content=f"<@{bot.id}> BXR status",
+        mentions=[bot],
+    )
+
+
+@pytest.mark.asyncio
+async def test_bxr_single_profile_runner_stamps_and_admits_source(bxr_adapter):
+    bxr_adapter.gateway_runner = _bxr_runner()
+    bxr_adapter.handle_message = AsyncMock()
+    bxr_adapter._write_bxr_origin_event = MagicMock(return_value="event-id")
+
+    assert await bxr_adapter._handle_bxr_operator_message(
+        _matching_bxr_message(bxr_adapter)
+    ) is True
+
+    event = bxr_adapter.handle_message.await_args.args[0]
+    assert event.source.profile == "bxr-operator"
+    assert event.metadata == {
+        "bxr_operator_ingress": True,
+        "origin_event_id": "event-id",
+        "authority_granted": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [
+        None,
+        _bxr_runner(active_profile="default"),
+        _bxr_runner(multiplex_profiles=True),
+    ],
+    ids=["absent-runner", "wrong-profile", "multiplex-mismatch"],
+)
+@pytest.mark.asyncio
+async def test_bxr_profile_ownership_mismatch_denies_without_dispatch(bxr_adapter, runner):
+    bxr_adapter.gateway_runner = runner
+    bxr_adapter.handle_message = AsyncMock()
+    bxr_adapter._write_bxr_origin_event = MagicMock(return_value="event-id")
+
+    assert await bxr_adapter._handle_bxr_operator_message(
+        _matching_bxr_message(bxr_adapter)
+    ) is False
+
+    bxr_adapter.handle_message.assert_not_awaited()
+    assert bxr_adapter._write_bxr_origin_event.call_args.kwargs["status"] == "DENIED"
+    assert (
+        bxr_adapter._write_bxr_origin_event.call_args.kwargs["reason"]
+        == "PROFILE_ROUTE_MISMATCH"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bxr_profile_mismatch_persists_metadata_only_denial(bxr_adapter):
+    bxr_adapter.gateway_runner = _bxr_runner(active_profile="default")
+    bxr_adapter.handle_message = AsyncMock()
+    message = _matching_bxr_message(bxr_adapter)
+
+    assert await bxr_adapter._handle_bxr_operator_message(message) is False
+
+    stored_files = list(bxr_adapter._bxr_origin_event_root().glob("*.json"))
+    assert len(stored_files) == 1
+    stored = stored_files[0].read_text(encoding="utf-8")
+    assert "BXR status" not in stored
+    assert "content" not in stored
+    assert "PROFILE_ROUTE_MISMATCH" in stored
+    assert '"authority_granted":false' in stored
+    bxr_adapter.handle_message.assert_not_awaited()
 
 
 def test_bxr_origin_event_is_content_free_immutable_and_bounded(bxr_adapter, monkeypatch, tmp_path):
