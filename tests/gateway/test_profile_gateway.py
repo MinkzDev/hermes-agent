@@ -12,8 +12,10 @@ from gateway.run import (
     TurnRunner,
     _BXR_OPERATOR_DISCORD_TOOLS,
     _BXR_OPERATOR_DISCORD_TOOLSETS,
+    _build_gateway_agent_history,
     _bxr_invoked_tool_names,
     _bxr_operator_session_metadata,
+    _bxr_operator_session_transcript_row,
     _bxr_operator_tool_surface_is_exact,
     _gateway_tool_definition_names,
     _is_bxr_operator_discord_source,
@@ -199,6 +201,59 @@ def test_bxr_session_metadata_is_closed_content_free_and_authority_negative():
     assert payload["invoked_bxr_tools"] == ["mcp__bxr_operator__bxr_status"]
     assert payload["authority_granted"] is False
     encoded = json.dumps(payload, sort_keys=True)
+    assert "raw request must not persist" not in encoded
+    assert "raw response must not persist" not in encoded
+    assert "terminal" not in encoded
+
+
+def test_bxr_session_metadata_round_trips_in_real_db_and_is_replay_inert(tmp_path):
+    from hermes_state import SessionDB
+
+    source = bxr_source(
+        user_id="700",
+        guild_id="100",
+        chat_id="800",
+        parent_chat_id="",
+    )
+    event = SimpleNamespace(
+        message_id="900",
+        timestamp=dt.datetime(2026, 8, 11, tzinfo=dt.timezone.utc),
+        text="raw request must not persist",
+    )
+    row = _bxr_operator_session_transcript_row(
+        source,
+        event,
+        ["mcp__bxr_operator__bxr_status", "terminal"],
+    )
+    expected = _bxr_operator_session_metadata(
+        source,
+        event,
+        ["mcp__bxr_operator__bxr_status", "terminal"],
+    )
+    assert row == {"role": "session_meta", "content": expected}
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        session_id = "bxr-session-metadata-round-trip"
+        db.create_session(session_id, source="discord")
+        db.append_message(
+            session_id=session_id,
+            role=row["role"],
+            content=row["content"],
+        )
+        stored = db.get_messages(session_id)
+    finally:
+        db.close()
+
+    assert len(stored) == 1
+    assert stored[0]["role"] == "session_meta"
+    assert stored[0]["content"] == expected
+    assert stored[0]["content"]["invoked_bxr_tools"] == [
+        "mcp__bxr_operator__bxr_status"
+    ]
+    assert stored[0]["content"]["authority_granted"] is False
+    assert _build_gateway_agent_history(stored) == ([], None)
+    encoded = json.dumps(stored, sort_keys=True)
     assert "raw request must not persist" not in encoded
     assert "raw response must not persist" not in encoded
     assert "terminal" not in encoded

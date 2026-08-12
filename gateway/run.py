@@ -241,6 +241,18 @@ def _bxr_operator_session_metadata(source: Any, event: Any, invoked_tools: Any) 
     }
 
 
+def _bxr_operator_session_transcript_row(
+    source: Any,
+    event: Any,
+    invoked_tools: Any,
+) -> dict:
+    """Wrap closed BXR turn metadata in the durable transcript content field."""
+    return {
+        "role": "session_meta",
+        "content": _bxr_operator_session_metadata(source, event, invoked_tools),
+    }
+
+
 def _hygiene_cooldown_for_failure(
     gateway,
     session_key: str,
@@ -18692,7 +18704,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _bxr_metadata_only:
                 await self.async_session_store.append_to_transcript(
                     session_entry.session_id,
-                    _bxr_operator_session_metadata(source, event, _bxr_invoked_tools),
+                    _bxr_operator_session_transcript_row(
+                        source,
+                        event,
+                        _bxr_invoked_tools,
+                    ),
                 )
             agent_failed_early = bool(agent_result.get("failed"))
             hidden_reasoning_incomplete = _is_gateway_hidden_reasoning_incomplete_turn(
